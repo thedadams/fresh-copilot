@@ -34,17 +34,25 @@ function createHarness(options = {}) {
     trust: options.trust ?? 'trusted',
     config: {
       automatic: true,
+      nextEditSuggestions: false,
       debounceMs: 350,
       quotaCooldownMinutes: 1440,
       ...options.config,
     },
     commands: [],
+    modes: [],
+    editorMode: options.editorMode ?? null,
+    editorModeChanges: [],
     events: [],
     statuses: [],
     contexts: [],
     bufferInfoReads: 0,
     virtualTexts: [],
+    virtualLines: [],
     virtualTextClears: [],
+    virtualLineClears: [],
+    overlays: [],
+    overlayClears: [],
     agentRequests: [],
     processSpawns: [],
     processKills: 0,
@@ -188,6 +196,22 @@ function createHarness(options = {}) {
       state.virtualTextClears.push({ bufferId, prefix });
       return true;
     },
+    addVirtualLine: (bufferId, position, text, style, above, namespace, priority) => {
+      state.virtualLines.push({ bufferId, position, text, style, above, namespace, priority });
+      return true;
+    },
+    clearVirtualTextNamespace: (bufferId, namespace) => {
+      state.virtualLineClears.push({ bufferId, namespace });
+      return true;
+    },
+    addOverlay: (bufferId, namespace, start, end, style) => {
+      state.overlays.push({ bufferId, namespace, start, end, style });
+      return true;
+    },
+    clearNamespace: (bufferId, namespace) => {
+      state.overlayClears.push({ bufferId, namespace });
+      return true;
+    },
 
     spawnBackgroundProcess: (command, args, cwd) => {
       state.processSpawns.push({ command, args, cwd });
@@ -204,6 +228,16 @@ function createHarness(options = {}) {
       state.commands.push({ name, description, handlerName, context });
       return true;
     },
+    defineMode: (name, bindings, readOnly, allowTextInput, inheritNormalBindings) => {
+      state.modes.push({ name, bindings, readOnly, allowTextInput, inheritNormalBindings });
+      return true;
+    },
+    setEditorMode: (mode) => {
+      state.editorMode = mode;
+      state.editorModeChanges.push(mode);
+      return true;
+    },
+    getEditorMode: () => state.editorMode,
     setContext: (name, active) => {
       state.contexts.push({ name, active });
       return true;
@@ -253,6 +287,31 @@ test('plugin registers its commands and starts the transport lazily', () => {
   assert.ok(state.commands.some((command) => command.name === 'Copilot: Sign In'));
   assert.ok(state.commands.some((command) => command.name === 'Copilot: Accept Suggestion'));
   assert.ok(state.events.some((event) => event.eventName === 'after_insert'));
+  assert.deepEqual(state.modes, [
+    {
+      name: 'fresh-copilot-suggestion',
+      bindings: [['Tab', 'fresh_copilot_accept']],
+      readOnly: false,
+      allowTextInput: false,
+      inheritNormalBindings: true,
+    },
+    {
+      name: 'fresh-copilot-suggestion-vi-insert',
+      bindings: [
+        ['Tab', 'fresh_copilot_accept'],
+        ['Escape', 'fresh_copilot_dismiss'],
+        ['Left', 'move_left'],
+        ['Down', 'move_down'],
+        ['Up', 'move_up'],
+        ['Right', 'move_right'],
+        ['C-p', 'command_palette'],
+        ['C-q', 'quit'],
+      ],
+      readOnly: false,
+      allowTextInput: false,
+      inheritNormalBindings: false,
+    },
+  ]);
 });
 
 test('an edit starts one agent, synchronizes the file, and renders a completion', async () => {
@@ -285,6 +344,58 @@ test('an edit starts one agent, synchronizes the file, and renders a completion'
   });
   assert.equal(harness.state.virtualTexts.at(-1).text, '42;');
   assert.equal(harness.state.virtualTexts.at(-1).style.fg, 'ui.suggestion_fg');
+  assert.equal(harness.state.editorMode, 'fresh-copilot-suggestion');
+});
+
+test('multiline completions render every continuation as a virtual line', async () => {
+  const harness = createHarness({
+    responses: [{ items: [{ insertText: 'first\n  second\nthird' }] }],
+  });
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  await harness.resolveNextDelay();
+
+  assert.equal(harness.state.virtualTexts.at(-1).text, 'first');
+  assert.deepEqual(
+    harness.state.virtualLines.map((line) => line.text),
+    ['  second', 'third'],
+  );
+});
+
+test('automatic next-edit suggestions render and apply replacements away from the cursor', async () => {
+  const text = 'const value = 1;\nconsole.log(value);';
+  const harness = createHarness({
+    text,
+    config: { nextEditSuggestions: true },
+    responses: [
+      {
+        edits: [
+          {
+            text: 'total',
+            textDocument: { uri: 'file:///work/example.ts', version: 1 },
+            range: {
+              start: { line: 1, character: 12 },
+              end: { line: 1, character: 17 },
+            },
+            command: { command: 'github.copilot.didAcceptCompletionItem', arguments: ['nes'] },
+          },
+        ],
+      },
+      null,
+    ],
+  });
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  await harness.resolveNextDelay();
+
+  assert.equal(harness.state.agentRequests[0].method, 'textDocument/copilotInlineEdit');
+  assert.equal(harness.state.virtualTexts.at(-1).text, '→ total');
+  assert.equal(harness.state.overlays.at(-1).style.strikethrough, true);
+
+  await harness.fire('fresh_copilot_accept');
+
+  assert.equal(harness.state.text, 'const value = 1;\nconsole.log(total);');
+  assert.equal(harness.state.agentRequests.at(-1).method, 'workspace/executeCommand');
 });
 
 test('rapid edits share one debounce timer and skip empty ghost-text clears', async () => {
@@ -330,8 +441,45 @@ test('accept applies the completion and acknowledges it through the same agent',
 
   assert.equal(harness.state.text, 'const answer = 42;');
   assert.equal(harness.state.cursor, 18);
+  assert.equal(harness.state.editorMode, null);
   assert.equal(harness.state.processSpawns.length, 1);
   assert.equal(harness.state.agentRequests.at(-1).method, 'workspace/executeCommand');
+});
+
+test('suggestions temporarily layer Tab over vi insert mode', async () => {
+  const harness = createHarness({
+    editorMode: 'vi-insert',
+    responses: [{ items: [{ insertText: '42;' }] }],
+  });
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  await harness.resolveNextDelay();
+
+  assert.equal(harness.state.virtualTexts.at(-1).text, '42;');
+  assert.equal(harness.state.editorMode, 'fresh-copilot-suggestion-vi-insert');
+
+  await harness.fire('fresh_copilot_accept');
+
+  assert.equal(harness.state.text, 'const answer = 42;');
+  assert.equal(harness.state.editorMode, 'vi-insert');
+  assert.deepEqual(harness.state.editorModeChanges, [
+    'fresh-copilot-suggestion-vi-insert',
+    'vi-insert',
+  ]);
+});
+
+test('suggestions leave unsupported editor modes untouched', async () => {
+  const harness = createHarness({
+    editorMode: 'vi-normal',
+    responses: [{ items: [{ insertText: '42;' }] }],
+  });
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  await harness.resolveNextDelay();
+
+  assert.equal(harness.state.virtualTexts.at(-1).text, '42;');
+  assert.equal(harness.state.editorMode, 'vi-normal');
+  assert.deepEqual(harness.state.editorModeChanges, []);
 });
 
 test('a failed replacement restores the original text', async () => {

@@ -7,6 +7,8 @@ It works with Copilot Free. There is no paid-only API or separate proxy: availab
 ## Features
 
 - Automatic completions after edits, with a configurable debounce
+- Full multiline ghost-text previews using inline and virtual-line rendering
+- Next-edit suggestions that can replace code away from the cursor
 - Manual completion, accept, dismiss, sign-in, sign-out, status, and retry commands
 - Correct UTF-8 Fresh offset to UTF-16 LSP position conversion, including emoji and CRLF files
 - Prefix-replacing and multiline completion support
@@ -49,15 +51,21 @@ Fresh will only start the language server in a trusted workspace. Trust the fold
 
 ## Using completions
 
-The plugin requests a suggestion after you edit an eligible source file. The first line appears as ghost text; multiline suggestions include a line-count marker. Accepting inserts the entire suggestion, not just the preview.
+The plugin requests a suggestion after you edit an eligible source file. Multiline suggestions render in full as ghost text without changing the buffer. When Copilot predicts a follow-up edit elsewhere in the file, the new text is prefixed with `→` and replaced text is struck through. Accepting applies the entire completion or edit.
 
-Fresh packages cannot safely claim a global default keybinding. Open **Edit → Keybinding Editor**, search for these commands, and assign the keys you prefer:
+Fresh plugins can provide keybindings through plugin modes. Fresh Copilot binds
+`Tab` to accept while ghost text is visible in Fresh's standard editing mode or
+Vi insert mode. The plugin restores the previous mode after accepting or
+dismissing the suggestion. In Vi insert mode, the first `Escape` dismisses a
+visible suggestion and restores Vi insert mode; a second `Escape` enters normal
+mode. Open **Edit → Keybinding Editor** to assign shortcuts to the other commands:
 
-| Command | Suggested key | Purpose |
+| Command | Key | Purpose |
 |---|---:|---|
-| `Copilot: Accept Suggestion` | `Alt+]` | Apply visible ghost text |
+| `Copilot: Accept Suggestion` | `Tab` (default while visible) | Apply visible ghost text |
 | `Copilot: Dismiss Suggestion` | `Alt+[` | Hide the current suggestion |
 | `Copilot: Complete` | `Alt+\` | Request a completion immediately |
+| `Copilot: Next Edit` | — | Request a predicted edit in the current file |
 
 All commands also remain available in the command palette.
 
@@ -82,6 +90,7 @@ Settings appear under the `fresh-copilot` plugin in Fresh's Settings UI.
 |---|---|---|
 | `enabled` | `true` | Master switch |
 | `automatic` | `true` | Request after edits; manual completion remains available when false |
+| `nextEditSuggestions` | `true` | Try Copilot next-edit predictions before ordinary automatic completions |
 | `debounceMs` | `350` | Delay after an edit before a request |
 | `maxFileSizeKb` | `512` | Skip larger files |
 | `disabledLanguages` | text, plaintext, log, diff, Git commit IDs | Fresh language IDs that should never consume completion usage |

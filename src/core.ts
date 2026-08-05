@@ -21,12 +21,28 @@ export interface InlineCompletionItem {
   [key: string]: unknown;
 }
 
+export interface InlineEditItem {
+  text: string;
+  textDocument: {
+    uri: string;
+    version: number;
+  };
+  range: LspRange;
+  command?: CompletionCommand;
+  [key: string]: unknown;
+}
+
 export interface CompletionEdit {
   start: number;
   end: number;
   insertText: string;
   replacedText: string;
   previewText: string;
+}
+
+export interface GhostSuggestionPreview {
+  inline: string;
+  lines: string[];
 }
 
 export interface TextSnapshot {
@@ -373,6 +389,30 @@ export function buildCompletionEdit(
   };
 }
 
+/** Build an arbitrary Copilot next-edit replacement, which may be away from the cursor. */
+export function buildInlineEdit(
+  text: string,
+  item: InlineEditItem,
+): CompletionEdit | null {
+  if (comparePositions(item.range.start, item.range.end) > 0) return null;
+
+  const startLocation = byteLocationAtPosition(text, item.range.start);
+  const endLocation = byteLocationAtPosition(text, item.range.end);
+  const start = startLocation.byteOffset;
+  const end = endLocation.byteOffset;
+  if (start > end || end > utf8ByteLength(text)) return null;
+
+  const replacedText = text.slice(startLocation.jsIndex, endLocation.jsIndex);
+  if (replacedText === item.text) return null;
+  return {
+    start,
+    end,
+    insertText: item.text,
+    replacedText,
+    previewText: item.text,
+  };
+}
+
 /** Compact multiline completion text into a single ghost-text label. */
 export function formatGhostPreview(
   previewText: string,
@@ -398,6 +438,30 @@ export function formatGhostPreview(
   return `${firstLine}${suffix}`;
 }
 
+/** Format the full suggestion as one inline fragment plus virtual lines. */
+export function formatGhostSuggestion(
+  previewText: string,
+  maximumLineLength = 160,
+  maximumLines = 20,
+): GhostSuggestionPreview {
+  const sanitized = previewText.replace(/\u0000/g, "").replace(/\r\n?/g, "\n");
+  const sourceLines = sanitized.split("\n");
+  const visibleLines = sourceLines.slice(0, Math.max(1, maximumLines));
+  const formatted = visibleLines.map((line) =>
+    line.length > maximumLineLength
+      ? `${line.slice(0, Math.max(1, maximumLineLength - 1))}…`
+      : line,
+  );
+  const omitted = sourceLines.length - visibleLines.length;
+  if (omitted > 0) {
+    formatted.push(`… +${omitted} more ${omitted === 1 ? "line" : "lines"}`);
+  }
+  return {
+    inline: formatted[0] ?? "",
+    lines: formatted.slice(1),
+  };
+}
+
 /** Parse only the subset of the Copilot inline response the plugin consumes. */
 export function parseInlineCompletionResponse(
   response: unknown,
@@ -420,6 +484,29 @@ export function parseInlineCompletionResponse(
     items.push(value as InlineCompletionItem);
   }
   return items;
+}
+
+/** Parse Copilot's custom textDocument/copilotInlineEdit response. */
+export function parseInlineEditResponse(response: unknown): InlineEditItem[] {
+  if (!isRecord(response) || !Array.isArray(response.edits)) return [];
+
+  const edits: InlineEditItem[] = [];
+  for (const value of response.edits) {
+    if (
+      !isRecord(value) ||
+      typeof value.text !== "string" ||
+      !isLspRange(value.range) ||
+      !isRecord(value.textDocument) ||
+      typeof value.textDocument.uri !== "string" ||
+      typeof value.textDocument.version !== "number" ||
+      !Number.isInteger(value.textDocument.version)
+    ) {
+      continue;
+    }
+    if (value.command !== undefined && !isCompletionCommand(value.command)) continue;
+    edits.push(value as unknown as InlineEditItem);
+  }
+  return edits;
 }
 
 export function errorText(error: unknown): string {

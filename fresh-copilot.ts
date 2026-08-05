@@ -1,23 +1,31 @@
 import {
   buildCompletionEdit,
+  buildInlineEdit,
   classifyFailure,
   createTextSnapshot,
   errorText,
-  formatGhostPreview,
+  formatGhostSuggestion,
   parseInlineCompletionResponse,
+  parseInlineEditResponse,
   statusNeedsSignIn,
   statusText,
   utf8ByteLength,
 } from "./src/core";
 
 type InlineCompletionItem = ReturnType<typeof parseInlineCompletionResponse>[number];
+type InlineEditItem = ReturnType<typeof parseInlineEditResponse>[number];
+type SuggestionItem = InlineCompletionItem | InlineEditItem;
+type SuggestionRequestMode = "auto" | "completion" | "next-edit";
 
 const editor = getEditor();
 
 const PLUGIN_VERSION = "0.1.0";
 const GHOST_PREFIX = "fresh-copilot:";
 const GHOST_ID = `${GHOST_PREFIX}suggestion`;
+const GHOST_NAMESPACE = "fresh-copilot-suggestion";
 const SUGGESTION_CONTEXT = "fresh-copilot-suggestion-visible";
+const SUGGESTION_MODE = "fresh-copilot-suggestion";
+const SUGGESTION_VI_INSERT_MODE = "fresh-copilot-suggestion-vi-insert";
 const DEFAULT_DISABLED_LANGUAGES = [
   "diff",
   "git-commit",
@@ -34,6 +42,7 @@ const SESSION_TOKEN =
 interface PluginConfig {
   enabled?: boolean;
   automatic?: boolean;
+  nextEditSuggestions?: boolean;
   debounceMs?: number;
   maxFileSizeKb?: number;
   disabledLanguages?: string[];
@@ -47,6 +56,7 @@ interface PluginConfig {
 interface ResolvedConfig {
   enabled: boolean;
   automatic: boolean;
+  nextEditSuggestions: boolean;
   debounceMs: number;
   maxFileSizeKb: number;
   disabledLanguages: string[];
@@ -58,10 +68,11 @@ interface ResolvedConfig {
 }
 
 interface ActiveSuggestion {
+  kind: "completion" | "next-edit";
   bufferId: number;
   revision: number;
   cursor: number;
-  item: InlineCompletionItem;
+  item: SuggestionItem;
   start: number;
   end: number;
   insertText: string;
@@ -108,6 +119,10 @@ editor.defineConfigBoolean("automatic", {
   default: true,
   description: "Request completions automatically while editing",
 });
+editor.defineConfigBoolean("nextEditSuggestions", {
+  default: true,
+  description: "Predict edits elsewhere in the current file after changes",
+});
 editor.defineConfigInteger("debounceMs", {
   default: 350,
   minimum: 100,
@@ -149,6 +164,9 @@ editor.defineConfigBoolean("debug", {
 
 let config = readConfig();
 let activeSuggestion: ActiveSuggestion | null = null;
+let suggestionModeActive = false;
+let suggestionPreviousMode: string | null = null;
+let activeSuggestionMode: string | null = null;
 let pauseState: PauseState | null = null;
 let requestGeneration = 0;
 let scheduledCompletion: ScheduledCompletion | null = null;
@@ -172,6 +190,7 @@ function readConfig(): ResolvedConfig {
   return {
     enabled: value.enabled ?? true,
     automatic: value.automatic ?? true,
+    nextEditSuggestions: value.nextEditSuggestions ?? true,
     debounceMs: value.debounceMs ?? 350,
     maxFileSizeKb: value.maxFileSizeKb ?? 512,
     disabledLanguages: (value.disabledLanguages ?? DEFAULT_DISABLED_LANGUAGES).map(
@@ -199,6 +218,37 @@ function bumpRevision(bufferId: number): void {
   revisions.set(bufferId, revision(bufferId) + 1);
 }
 
+function activateSuggestionMode(): void {
+  if (suggestionModeActive) return;
+  const previousMode = editor.getEditorMode();
+  const mode =
+    previousMode === null
+      ? SUGGESTION_MODE
+      : previousMode === "vi-insert"
+        ? SUGGESTION_VI_INSERT_MODE
+        : null;
+  if (mode === null) return;
+  suggestionPreviousMode = previousMode;
+  activeSuggestionMode = mode;
+  suggestionModeActive = editor.setEditorMode(mode);
+  if (!suggestionModeActive) {
+    suggestionPreviousMode = null;
+    activeSuggestionMode = null;
+  }
+}
+
+function deactivateSuggestionMode(): void {
+  if (!suggestionModeActive) return;
+  const previousMode = suggestionPreviousMode;
+  const mode = activeSuggestionMode;
+  suggestionModeActive = false;
+  suggestionPreviousMode = null;
+  activeSuggestionMode = null;
+  if (editor.getEditorMode() === mode) {
+    editor.setEditorMode(previousMode);
+  }
+}
+
 function clearSuggestion(bufferId?: number): void {
   const suggestion = activeSuggestion;
   if (suggestion === null) return;
@@ -207,8 +257,54 @@ function clearSuggestion(bufferId?: number): void {
   if (target !== suggestion.bufferId) return;
 
   editor.removeVirtualTextsByPrefix(target, GHOST_PREFIX);
+  editor.clearVirtualTextNamespace(target, GHOST_NAMESPACE);
+  editor.clearNamespace(target, GHOST_NAMESPACE);
   activeSuggestion = null;
   editor.setContext(SUGGESTION_CONTEXT, false);
+  deactivateSuggestionMode();
+}
+
+function renderSuggestion(
+  bufferId: number,
+  position: number,
+  previewText: string,
+  replacementStart: number,
+  replacementEnd: number,
+  kind: "completion" | "next-edit",
+): boolean {
+  const preview = formatGhostSuggestion(previewText);
+  const inline = `${kind === "next-edit" ? "→ " : ""}${preview.inline}`;
+  if (inline.length > 0) {
+    editor.addVirtualTextStyled(
+      bufferId,
+      GHOST_ID,
+      position,
+      inline,
+      { fg: "ui.suggestion_fg", italic: true },
+      true,
+    );
+  }
+  preview.lines.forEach((line, index) => {
+    editor.addVirtualLine(
+      bufferId,
+      position,
+      line,
+      { fg: "ui.suggestion_fg", italic: true },
+      false,
+      GHOST_NAMESPACE,
+      index,
+    );
+  });
+  if (replacementEnd > replacementStart) {
+    editor.addOverlay(
+      bufferId,
+      GHOST_NAMESPACE,
+      replacementStart,
+      replacementEnd,
+      { fg: "ui.suggestion_fg", strikethrough: true },
+    );
+  }
+  return inline.length > 0 || preview.lines.length > 0 || replacementEnd > replacementStart;
 }
 
 function eligibleBufferInfo(bufferId: number): BufferInfo | null {
@@ -583,7 +679,7 @@ async function drainScheduledCompletion(): Promise<void> {
     ) {
       continue;
     }
-    void requestCompletion(scheduled.bufferId, scheduled.generation, false);
+    void requestCompletion(scheduled.bufferId, scheduled.generation, "auto");
   }
 }
 
@@ -602,14 +698,17 @@ function startCompletionScheduler(): void {
   );
 }
 
-function scheduleCompletion(bufferId: number, explicit = false): void {
+function scheduleCompletion(
+  bufferId: number,
+  mode: SuggestionRequestMode = "auto",
+): void {
   requestGeneration += 1;
   const generation = requestGeneration;
   clearSuggestion(bufferId);
 
-  if (explicit) {
+  if (mode !== "auto") {
     scheduledCompletion = null;
-    void requestCompletion(bufferId, generation, true);
+    void requestCompletion(bufferId, generation, mode);
     return;
   }
   if (!config.enabled || !config.automatic || currentPause() !== null) {
@@ -628,8 +727,9 @@ function scheduleCompletion(bufferId: number, explicit = false): void {
 async function requestCompletion(
   bufferId: number,
   generation: number,
-  explicit: boolean,
+  mode: SuggestionRequestMode,
 ): Promise<void> {
+  const explicit = mode !== "auto";
   try {
     if (
       generation !== requestGeneration ||
@@ -662,16 +762,79 @@ async function requestCompletion(
     if (uri.length === 0) return;
     documentUris.set(bufferId, uri);
 
-    const response = await agentRpc(
-      "textDocument/inlineCompletion",
-      {
-        textDocument: { uri },
-        position: textSnapshot.cursorPosition,
-        formattingOptions: { insertSpaces: true, tabSize: 4 },
-        context: { triggerKind: explicit ? 1 : 2 },
-      },
-      { uri, languageId: info.language, text },
-    );
+    let item: SuggestionItem | undefined;
+    let kind: "completion" | "next-edit" = "completion";
+    let edit = null;
+    const tryNextEdit =
+      mode === "next-edit" || (mode === "auto" && config.nextEditSuggestions);
+    if (tryNextEdit) {
+      try {
+        const response = await agentRpc(
+          "textDocument/copilotInlineEdit",
+          {
+            textDocument: { uri },
+            position: textSnapshot.cursorPosition,
+          },
+          { uri, languageId: info.language, text },
+        );
+        const nextEdit = parseInlineEditResponse(response).find(
+          (candidate) => candidate.textDocument.uri === uri,
+        );
+        if (nextEdit !== undefined) {
+          const candidateEdit = buildInlineEdit(text, nextEdit);
+          if (candidateEdit !== null) {
+            item = nextEdit;
+            kind = "next-edit";
+            edit = candidateEdit;
+          }
+        }
+      } catch (error) {
+        const failure = classifyFailure(error);
+        if (
+          failure === "quota" ||
+          failure === "authentication" ||
+          failure === "server-missing"
+        ) {
+          throw error;
+        }
+        debug(`next-edit request unavailable: ${errorText(error)}`);
+      }
+    }
+
+    if (
+      generation !== requestGeneration ||
+      bufferId !== editor.getActiveBufferId() ||
+      requestedRevision !== revision(bufferId) ||
+      cursor !== editor.getCursorPosition()
+    ) {
+      return;
+    }
+
+    if (edit === null && mode !== "next-edit") {
+      const response = await agentRpc(
+        "textDocument/inlineCompletion",
+        {
+          textDocument: { uri },
+          position: textSnapshot.cursorPosition,
+          formattingOptions: { insertSpaces: true, tabSize: 4 },
+          context: { triggerKind: explicit ? 1 : 2 },
+        },
+        { uri, languageId: info.language, text },
+      );
+      const completion = parseInlineCompletionResponse(response)[0];
+      if (completion !== undefined) {
+        const candidateEdit = buildCompletionEdit(
+          text,
+          cursor,
+          completion,
+          textSnapshot,
+        );
+        if (candidateEdit !== null) {
+          item = completion;
+          edit = candidateEdit;
+        }
+      }
+    }
     transientFailures = 0;
     if (pauseState?.kind === "transient") pauseState = null;
 
@@ -684,24 +847,18 @@ async function requestCompletion(
       return;
     }
 
-    const item = parseInlineCompletionResponse(response)[0];
-    if (item === undefined) {
+    if (item === undefined || edit === null) {
       clearSuggestion(bufferId);
+      if (mode === "next-edit") editor.setStatus("Copilot has no next edit to suggest");
       return;
     }
     if (pauseState?.kind === "quota" || pauseState?.kind === "authentication") {
       pauseState = null;
       quotaNoticeShown = false;
     }
-    const edit = buildCompletionEdit(text, cursor, item, textSnapshot);
-    if (edit === null) {
-      clearSuggestion(bufferId);
-      return;
-    }
-    const preview = formatGhostPreview(edit.previewText);
-    if (preview.length === 0) return;
 
     activeSuggestion = {
+      kind,
       bufferId,
       revision: requestedRevision,
       cursor,
@@ -711,15 +868,12 @@ async function requestCompletion(
       insertText: edit.insertText,
       replacedText: edit.replacedText,
     };
-    editor.addVirtualTextStyled(
-      bufferId,
-      GHOST_ID,
-      cursor,
-      preview,
-      { fg: "ui.suggestion_fg", italic: true },
-      true,
-    );
+    if (!renderSuggestion(bufferId, edit.start, edit.previewText, edit.start, edit.end, kind)) {
+      activeSuggestion = null;
+      return;
+    }
     editor.setContext(SUGGESTION_CONTEXT, true);
+    activateSuggestionMode();
   } catch (error) {
     if (generation === requestGeneration) handleFailure(error, explicit);
   }
@@ -741,7 +895,15 @@ async function completeNow(): Promise<void> {
     );
     return;
   }
-  scheduleCompletion(editor.getActiveBufferId(), true);
+  scheduleCompletion(editor.getActiveBufferId(), "completion");
+}
+
+async function nextEditNow(): Promise<void> {
+  if (!config.enabled) {
+    editor.setStatus("GitHub Copilot completions are disabled in plugin settings");
+    return;
+  }
+  scheduleCompletion(editor.getActiveBufferId(), "next-edit");
 }
 
 async function acceptSuggestion(): Promise<void> {
@@ -888,7 +1050,7 @@ function retryNow(): void {
   transientFailures = 0;
   stopAgent();
   editor.setStatus("Retrying GitHub Copilot…");
-  scheduleCompletion(editor.getActiveBufferId(), true);
+  scheduleCompletion(editor.getActiveBufferId(), "completion");
 }
 
 function onEdit(event: BufferEvent): void {
@@ -939,6 +1101,7 @@ function onTrustChanged(): void {
 }
 
 registerHandler("fresh_copilot_complete", completeNow);
+registerHandler("fresh_copilot_next_edit", nextEditNow);
 registerHandler("fresh_copilot_accept", acceptSuggestion);
 registerHandler("fresh_copilot_dismiss", dismissSuggestion);
 registerHandler("fresh_copilot_sign_in", signIn);
@@ -953,10 +1116,39 @@ registerHandler("fresh_copilot_buffer_closed", onBufferClosed);
 registerHandler("fresh_copilot_config_changed", onConfigChanged);
 registerHandler("fresh_copilot_trust_changed", onTrustChanged);
 
+editor.defineMode(
+  SUGGESTION_MODE,
+  [["Tab", "fresh_copilot_accept"]],
+  false,
+  false,
+  true,
+);
+editor.defineMode(
+  SUGGESTION_VI_INSERT_MODE,
+  [
+    ["Tab", "fresh_copilot_accept"],
+    ["Escape", "fresh_copilot_dismiss"],
+    ["Left", "move_left"],
+    ["Down", "move_down"],
+    ["Up", "move_up"],
+    ["Right", "move_right"],
+    ["C-p", "command_palette"],
+    ["C-q", "quit"],
+  ],
+  false,
+  false,
+  false,
+);
+
 editor.registerCommand(
   "Copilot: Complete",
   "Request a GitHub Copilot completion now",
   "fresh_copilot_complete",
+);
+editor.registerCommand(
+  "Copilot: Next Edit",
+  "Request a predicted edit elsewhere in the current file",
+  "fresh_copilot_next_edit",
 );
 editor.registerCommand(
   "Copilot: Accept Suggestion",

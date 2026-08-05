@@ -82,6 +82,24 @@ interface EditorAPI {
     before: boolean,
   ): boolean;
   removeVirtualTextsByPrefix(bufferId: number, prefix: string): boolean;
+  addVirtualLine(
+    bufferId: number,
+    position: number,
+    text: string,
+    options: Record<string, unknown>,
+    above: boolean,
+    namespace: string,
+    priority: number,
+  ): boolean;
+  clearVirtualTextNamespace(bufferId: number, namespace: string): boolean;
+  addOverlay(
+    bufferId: number,
+    namespace: string,
+    start: number,
+    end: number,
+    options: Record<string, unknown>,
+  ): boolean;
+  clearNamespace(bufferId: number, namespace: string): boolean;
 
   spawnBackgroundProcess(
     command: string,
@@ -97,6 +115,15 @@ interface EditorAPI {
     handlerName: string,
     context?: string | null,
   ): boolean;
+  defineMode(
+    name: string,
+    bindingsArr: string[][],
+    readOnly?: boolean,
+    allowTextInput?: boolean,
+    inheritNormalBindings?: boolean,
+  ): boolean;
+  setEditorMode(mode: string | null): boolean;
+  getEditorMode(): string | null;
   setContext(name: string, active: boolean): boolean;
   prompt(label: string, initialValue: string): Promise<string | null>;
   copyToClipboard(text: string): void;

@@ -5,11 +5,14 @@ const test = require('node:test');
 
 const {
   buildCompletionEdit,
+  buildInlineEdit,
   byteOffsetAtPosition,
   classifyFailure,
   createTextSnapshot,
   formatGhostPreview,
+  formatGhostSuggestion,
   parseInlineCompletionResponse,
+  parseInlineEditResponse,
   positionAtByteOffset,
   statusNeedsSignIn,
   statusText,
@@ -205,6 +208,37 @@ test('formatGhostPreview makes multiline suggestions compact', () => {
   assert.equal(formatGhostPreview('\nsecond\nthird'), '↵ +2 lines');
   assert.equal(formatGhostPreview('first\r\nsecond'), 'first  ↵ +1 line');
   assert.equal(formatGhostPreview('abcdefghij', 6), 'abcde…');
+});
+
+test('formatGhostSuggestion preserves multiline suggestions as virtual lines', () => {
+  assert.deepEqual(formatGhostSuggestion('first\r\n  second\nthird'), {
+    inline: 'first',
+    lines: ['  second', 'third'],
+  });
+  assert.deepEqual(formatGhostSuggestion('abcdefgh\nsecond', 5), {
+    inline: 'abcd…',
+    lines: ['seco…'],
+  });
+});
+
+test('next edits may replace text away from the cursor', () => {
+  const item = {
+    text: 'total',
+    textDocument: { uri: 'file:///work/example.ts', version: 2 },
+    range: {
+      start: { line: 1, character: 4 },
+      end: { line: 1, character: 9 },
+    },
+    command: { command: 'github.copilot.accept', arguments: ['id'] },
+  };
+  assert.deepEqual(buildInlineEdit('one\nlet value = 1;', item), {
+    start: 8,
+    end: 13,
+    insertText: 'total',
+    replacedText: 'value',
+    previewText: 'total',
+  });
+  assert.deepEqual(parseInlineEditResponse({ edits: [item, { text: 42 }] }), [item]);
 });
 
 test('parseInlineCompletionResponse filters malformed items', () => {
