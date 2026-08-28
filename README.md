@@ -51,7 +51,7 @@ Fresh will only start the language server in a trusted workspace. Trust the fold
 
 ## Using completions
 
-The plugin requests a suggestion after you edit an eligible source file. Multiline suggestions render in full as ghost text without changing the buffer. When Copilot predicts a follow-up edit elsewhere in the file, the new text is prefixed with `→` and replaced text is struck through. Accepting applies the entire completion or edit.
+The plugin requests a suggestion after you edit an eligible source file. Multiline suggestions render in full as ghost text without changing the buffer. When Copilot predicts a follow-up replacement elsewhere in the file, the existing text remains readable with a subtle underline and the proposed text appears after it as `old → new`. Accepting applies the entire completion or edit.
 
 Fresh plugins can provide keybindings through plugin modes. Fresh Copilot binds
 `Tab` to accept while ghost text is visible in Fresh's standard editing mode or

@@ -389,13 +389,46 @@ test('automatic next-edit suggestions render and apply replacements away from th
   await harness.resolveNextDelay();
 
   assert.equal(harness.state.agentRequests[0].method, 'textDocument/copilotInlineEdit');
-  assert.equal(harness.state.virtualTexts.at(-1).text, '→ total');
-  assert.equal(harness.state.overlays.at(-1).style.strikethrough, true);
+  assert.deepEqual(harness.state.virtualTexts.at(-1), {
+    bufferId: 1,
+    id: 'fresh-copilot:suggestion',
+    position: Buffer.byteLength('const value = 1;\nconsole.log(value', 'utf8'),
+    text: ' → total',
+    style: { fg: 'ui.suggestion_fg', italic: true },
+    before: true,
+  });
+  assert.deepEqual(harness.state.overlays.at(-1).style, { underline: true });
 
   await harness.fire('fresh_copilot_accept');
 
   assert.equal(harness.state.text, 'const value = 1;\nconsole.log(total);');
   assert.equal(harness.state.agentRequests.at(-1).method, 'workspace/executeCommand');
+});
+
+test('prefix-replacing completions stay readable as ordinary cursor ghost text', async () => {
+  const harness = createHarness({
+    text: 'const foo',
+    responses: [
+      {
+        items: [
+          {
+            insertText: 'foobar',
+            range: {
+              start: { line: 0, character: 6 },
+              end: { line: 0, character: 9 },
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  await harness.resolveNextDelay();
+
+  assert.equal(harness.state.virtualTexts.at(-1).text, 'bar');
+  assert.equal(harness.state.virtualTexts.at(-1).position, 9);
+  assert.equal(harness.state.overlays.length, 0);
 });
 
 test('rapid edits share one debounce timer and skip empty ghost-text clears', async () => {

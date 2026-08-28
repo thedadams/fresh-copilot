@@ -271,14 +271,22 @@ function renderSuggestion(
   replacementStart: number,
   replacementEnd: number,
   kind: "completion" | "next-edit",
+  showReplacement: boolean,
 ): boolean {
   const preview = formatGhostSuggestion(previewText);
-  const inline = `${kind === "next-edit" ? "→ " : ""}${preview.inline}`;
+  const displayPosition = showReplacement ? replacementEnd : position;
+  const prefix = showReplacement ? " → " : kind === "next-edit" ? "→ " : "";
+  const inline =
+    preview.inline.length > 0
+      ? `${prefix}${preview.inline}`
+      : showReplacement
+        ? " → delete"
+        : "";
   if (inline.length > 0) {
     editor.addVirtualTextStyled(
       bufferId,
       GHOST_ID,
-      position,
+      displayPosition,
       inline,
       { fg: "ui.suggestion_fg", italic: true },
       true,
@@ -287,7 +295,7 @@ function renderSuggestion(
   preview.lines.forEach((line, index) => {
     editor.addVirtualLine(
       bufferId,
-      position,
+      displayPosition,
       line,
       { fg: "ui.suggestion_fg", italic: true },
       false,
@@ -295,16 +303,16 @@ function renderSuggestion(
       index,
     );
   });
-  if (replacementEnd > replacementStart) {
+  if (showReplacement) {
     editor.addOverlay(
       bufferId,
       GHOST_NAMESPACE,
       replacementStart,
       replacementEnd,
-      { fg: "ui.suggestion_fg", strikethrough: true },
+      { underline: true },
     );
   }
-  return inline.length > 0 || preview.lines.length > 0 || replacementEnd > replacementStart;
+  return inline.length > 0 || preview.lines.length > 0 || showReplacement;
 }
 
 function eligibleBufferInfo(bufferId: number): BufferInfo | null {
@@ -868,7 +876,24 @@ async function requestCompletion(
       insertText: edit.insertText,
       replacedText: edit.replacedText,
     };
-    if (!renderSuggestion(bufferId, edit.start, edit.previewText, edit.start, edit.end, kind)) {
+    const simplePrefixCompletion =
+      kind === "completion" &&
+      edit.end === cursor &&
+      edit.insertText.startsWith(edit.replacedText);
+    const showReplacement =
+      edit.end > edit.start && !simplePrefixCompletion;
+    const displayPosition = kind === "completion" ? cursor : edit.start;
+    if (
+      !renderSuggestion(
+        bufferId,
+        displayPosition,
+        edit.previewText,
+        edit.start,
+        edit.end,
+        kind,
+        showReplacement,
+      )
+    ) {
       activeSuggestion = null;
       return;
     }
