@@ -244,7 +244,8 @@ function deactivateSuggestionMode(): void {
   suggestionModeActive = false;
   suggestionPreviousMode = null;
   activeSuggestionMode = null;
-  if (editor.getEditorMode() === mode) {
+  const currentMode = editor.getEditorMode();
+  if (currentMode === mode || currentMode === previousMode) {
     editor.setEditorMode(previousMode);
   }
 }

@@ -43,6 +43,7 @@ function createHarness(options = {}) {
     modes: [],
     editorMode: options.editorMode ?? null,
     editorModeChanges: [],
+    pendingEditorModeChanges: [],
     events: [],
     statuses: [],
     contexts: [],
@@ -233,8 +234,12 @@ function createHarness(options = {}) {
       return true;
     },
     setEditorMode: (mode) => {
-      state.editorMode = mode;
       state.editorModeChanges.push(mode);
+      if (options.deferEditorModeWrites) {
+        state.pendingEditorModeChanges.push(mode);
+      } else {
+        state.editorMode = mode;
+      }
       return true;
     },
     getEditorMode: () => state.editorMode,
@@ -277,7 +282,21 @@ function createHarness(options = {}) {
     return pending.durationMs;
   }
 
-  return { state, handlers, delays, fire, resolveNextDelay };
+  function applyPendingEditorModeChanges() {
+    for (const mode of state.pendingEditorModeChanges) {
+      state.editorMode = mode;
+    }
+    state.pendingEditorModeChanges.length = 0;
+  }
+
+  return {
+    state,
+    handlers,
+    delays,
+    fire,
+    resolveNextDelay,
+    applyPendingEditorModeChanges,
+  };
 }
 
 test('plugin registers its commands and starts the transport lazily', () => {
@@ -494,6 +513,31 @@ test('suggestions temporarily layer Tab over vi insert mode', async () => {
   await harness.fire('fresh_copilot_accept');
 
   assert.equal(harness.state.text, 'const answer = 42;');
+  assert.equal(harness.state.editorMode, 'vi-insert');
+  assert.deepEqual(harness.state.editorModeChanges, [
+    'fresh-copilot-suggestion-vi-insert',
+    'vi-insert',
+  ]);
+});
+
+test('queued mode writes cannot strand vi insert mode', async () => {
+  const harness = createHarness({
+    editorMode: 'vi-insert',
+    deferEditorModeWrites: true,
+    responses: [{ items: [{ insertText: '42;' }] }],
+  });
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  await harness.resolveNextDelay();
+
+  assert.equal(harness.state.editorMode, 'vi-insert');
+  assert.deepEqual(harness.state.pendingEditorModeChanges, [
+    'fresh-copilot-suggestion-vi-insert',
+  ]);
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  harness.applyPendingEditorModeChanges();
+
   assert.equal(harness.state.editorMode, 'vi-insert');
   assert.deepEqual(harness.state.editorModeChanges, [
     'fresh-copilot-suggestion-vi-insert',
