@@ -58,7 +58,8 @@ function createHarness(options = {}) {
     processSpawns: [],
     processKills: 0,
     writes: [],
-    removals: [],
+    scratchCreated: [],
+    scratchDiscarded: [],
     inserts: [],
     deletes: [],
     cursorMoves: [],
@@ -173,14 +174,6 @@ function createHarness(options = {}) {
       return true;
     },
     createDir: () => true,
-    removePath: (target) => {
-      const value = filePath(target);
-      state.removals.push(value);
-      for (const key of [...files.keys()]) {
-        if (key === value || key.startsWith(`${value}/`)) files.delete(key);
-      }
-      return true;
-    },
     workspaceTrustLevel: () => state.trust,
 
     defineConfigBoolean: (_name, definition) => definition.default,
@@ -252,6 +245,21 @@ function createHarness(options = {}) {
     setStatus: (value) => state.statuses.push(value),
     debug: () => {},
   };
+
+  // Fresh 0.5 replaced path deletion with editor-owned scratch directories.
+  if (options.scratch) {
+    editor.getAuthorityLabel = () => options.authorityLabel ?? '';
+    editor.scratchCreate = (label) => {
+      const token = `token-${state.scratchCreated.length + 1}`;
+      state.scratchCreated.push({ label, token });
+      return token;
+    };
+    editor.scratchPath = (token) => `/config/staging/${token}`;
+    editor.scratchDiscard = (token) => {
+      state.scratchDiscarded.push(token);
+      return true;
+    };
+  }
 
   const previousGetEditor = global.getEditor;
   const previousRegisterHandler = global.registerHandler;
@@ -660,4 +668,66 @@ test('device sign-in uses one persistent server for both protocol steps', async 
   );
   assert.equal(harness.state.processSpawns.length, 1);
   assert.match(harness.state.statuses.at(-1), /signed in/);
+});
+
+async function signIn(harness) {
+  await harness.fire('fresh_copilot_sign_in');
+  assert.match(harness.state.statuses.at(-1), /signed in/);
+}
+
+function signInResponses() {
+  return [
+    { verificationUri: 'https://github.com/login/device', userCode: 'ABCD-1234' },
+    { status: 'OK', user: 'octocat' },
+  ];
+}
+
+test('local sessions live in an editor-owned scratch directory', async () => {
+  const harness = createHarness({ scratch: true, responses: signInResponses() });
+  await signIn(harness);
+
+  assert.deepEqual(harness.state.scratchCreated, [
+    { label: 'fresh-copilot', token: 'token-1' },
+  ]);
+  assert.deepEqual(harness.state.processSpawns[0].args, [
+    '/config/staging/token-1/copilot-agent.mjs',
+    '/config/staging/token-1/config.json',
+  ]);
+
+  harness.delays.length = 0;
+  await harness.fire('fresh_copilot_retry');
+  assert.ok(
+    harness.state.writes.some(
+      (write) => write.path === '/config/staging/token-1/shutdown.json',
+    ),
+  );
+  assert.equal(harness.state.processKills, 0);
+  const grace = harness.delays.find((pending) => pending.durationMs === 3000);
+  assert.ok(grace, 'expected a shutdown grace period');
+  grace.resolve();
+  await flush();
+  await flush();
+  assert.equal(harness.state.processKills, 1);
+  assert.deepEqual(harness.state.scratchDiscarded, ['token-1']);
+});
+
+test('remote authorities keep the temp session and leave cleanup to the transport', async () => {
+  const harness = createHarness({
+    scratch: true,
+    authorityLabel: 'Container:abc123',
+    responses: signInResponses(),
+  });
+  await signIn(harness);
+
+  assert.equal(harness.state.scratchCreated.length, 0);
+  const [agentPath] = harness.state.processSpawns[0].args;
+  assert.match(agentPath, /^\/tmp\/fresh-copilot-[^/]+-1\/copilot-agent\.mjs$/);
+
+  await harness.fire('fresh_copilot_retry');
+  assert.ok(
+    harness.state.writes.some((write) =>
+      write.path === path.posix.join(path.posix.dirname(agentPath), 'shutdown.json'),
+    ),
+  );
+  assert.equal(harness.state.scratchDiscarded.length, 0);
 });

@@ -34,6 +34,7 @@ const DEFAULT_DISABLED_LANGUAGES = [
   "plaintext",
   "text",
 ];
+const SHUTDOWN_GRACE_MS = 3000;
 const SESSION_TOKEN =
   Date.now().toString(36) +
   "-" +
@@ -99,6 +100,11 @@ interface AgentDocument {
   uri: string;
   languageId: string;
   text: string;
+}
+
+interface AgentSession {
+  dir: string;
+  scratchToken: string | null;
 }
 
 interface AgentEnvelope {
@@ -176,7 +182,7 @@ let quotaNoticeShown = false;
 let agentHandle: ProcessHandle<BackgroundProcessResult> | null = null;
 let agentReady = false;
 let agentStartPromise: Promise<void> | null = null;
-let agentSessionDir = "";
+let agentSession: AgentSession | null = null;
 let agentFailure = "";
 let agentStartCount = 0;
 let rpcCounter = 0;
@@ -418,28 +424,63 @@ function parseJson(value: unknown): unknown | null {
   }
 }
 
+function createSession(): AgentSession {
+  if (
+    editor.scratchCreate !== undefined &&
+    editor.scratchPath !== undefined &&
+    editor.getAuthorityLabel?.() === ""
+  ) {
+    const token = editor.scratchCreate("fresh-copilot");
+    const dir = token === null ? null : editor.scratchPath(token);
+    if (token !== null && dir !== null) return { dir, scratchToken: token };
+    if (token !== null) editor.scratchDiscard?.(token);
+  }
+
+  agentStartCount += 1;
+  const dir = editor.pathJoin(
+    editor.getTempDir(),
+    `fresh-copilot-${SESSION_TOKEN}-${agentStartCount}`,
+  );
+  if (!editor.createDir(dir)) {
+    throw new Error(`could not create Copilot session directory: ${dir}`);
+  }
+  return { dir, scratchToken: null };
+}
+
+function releaseSession(session: AgentSession): void {
+  if (session.scratchToken !== null) {
+    editor.scratchDiscard?.(session.scratchToken);
+  }
+}
+
 function stopAgent(): void {
   const handle = agentHandle;
-  const oldSession = agentSessionDir;
+  const session = agentSession;
   agentHandle = null;
   agentReady = false;
   agentStartPromise = null;
-  agentSessionDir = "";
+  agentSession = null;
   agentFailure = "";
   lastAgentStatusVersion = 0;
   lastAgentEventVersion = 0;
-  if (handle !== null) {
-    void handle.kill().then(
-      () => {
-        if (oldSession.length > 0) editor.removePath(oldSession);
-      },
-      () => {
-        if (oldSession.length > 0) editor.removePath(oldSession);
-      },
-    );
-  } else if (oldSession.length > 0) {
-    editor.removePath(oldSession);
+  if (session === null) return;
+  if (handle === null) {
+    releaseSession(session);
+    return;
   }
+
+  editor.writeFile(editor.pathJoin(session.dir, "shutdown.json"), "{}");
+  const exited = handle.result.then(
+    () => true,
+    () => true,
+  );
+  const graceExpired = editor.delay(SHUTDOWN_GRACE_MS).then(() => false);
+  void Promise.race([exited, graceExpired])
+    .then((done) => (done ? true : handle.kill()))
+    .then(
+      () => releaseSession(session),
+      () => releaseSession(session),
+    );
 }
 
 async function startAgent(): Promise<void> {
@@ -447,14 +488,10 @@ async function startAgent(): Promise<void> {
     throw new Error("workspace is not trusted");
   }
 
-  agentStartCount += 1;
-  const sessionDir = editor.pathJoin(
-    editor.getTempDir(),
-    `fresh-copilot-${SESSION_TOKEN}-${agentStartCount}`,
-  );
-  if (!editor.createDir(sessionDir)) {
-    throw new Error(`could not create Copilot session directory: ${sessionDir}`);
-  }
+  const session = createSession();
+  const sessionDir = session.dir;
+
+  agentSession = session;
 
   const sourcePath = editor.pathJoin(
     editor.getPluginDir(),
@@ -494,25 +531,24 @@ async function startAgent(): Promise<void> {
     cwd,
   );
   agentHandle = handle;
-  agentSessionDir = sessionDir;
   agentFailure = "";
   void handle.result.then(
     (result) => {
       if (agentHandle === handle) {
         agentReady = false;
         agentHandle = null;
-        agentSessionDir = "";
+        agentSession = null;
         agentFailure = `Copilot transport exited with code ${result.exit_code}`;
-        editor.removePath(sessionDir);
+        releaseSession(session);
       }
     },
     (error) => {
       if (agentHandle === handle) {
         agentReady = false;
         agentHandle = null;
-        agentSessionDir = "";
+        agentSession = null;
         agentFailure = errorText(error);
-        editor.removePath(sessionDir);
+        releaseSession(session);
       }
     },
   );
@@ -614,7 +650,11 @@ async function agentRpc(
   document?: AgentDocument,
 ): Promise<unknown> {
   await ensureAgent();
-  const sessionDir = agentSessionDir;
+  const session = agentSession;
+  if (session === null) {
+    throw new Error("Copilot transport stopped before the request");
+  }
+  const sessionDir = session.dir;
   rpcCounter += 1;
   const id = String(rpcCounter).padStart(10, "0");
   const requestPath = editor.pathJoin(sessionDir, `request-${id}.json`);
@@ -630,13 +670,11 @@ async function agentRpc(
   const started = Date.now();
   let nextFatalCheck = started;
   while (Date.now() - started < timeoutMs) {
-    if (sessionDir !== agentSessionDir) {
+    if (session !== agentSession) {
       throw new Error("Copilot transport restarted during a request");
     }
     const raw = editor.readFile(responsePath);
     if (typeof raw === "string") {
-      editor.removePath(requestPath);
-      editor.removePath(responsePath);
       const parsed = parseJson(raw);
       if (typeof parsed !== "object" || parsed === null) {
         throw new Error("Copilot transport returned invalid JSON");
@@ -663,7 +701,6 @@ async function agentRpc(
     await editor.delay(elapsed < 1000 ? 20 : elapsed < 5000 ? 50 : 100);
   }
 
-  editor.removePath(requestPath);
   throw new Error(`${method} timed out waiting for the Copilot transport`);
 }
 

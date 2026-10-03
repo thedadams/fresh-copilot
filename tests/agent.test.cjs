@@ -144,3 +144,94 @@ test('agent keeps one server alive, synchronizes documents, and forwards request
     traceMessages(tracePath).some((message) => message.method === 'textDocument/didClose'),
   );
 });
+
+function startAgent(t, options = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-copilot-agent-test-'));
+  const sessionDir = path.join(root, 'session');
+  fs.mkdirSync(sessionDir);
+  const tracePath = path.join(root, 'trace.jsonl');
+  fs.writeFileSync(tracePath, '');
+  const configPath = path.join(sessionDir, 'config.json');
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      sessionDir,
+      cwd: root,
+      rootUri: `file://${root}`,
+      serverCommand: options.serverCommand ?? process.execPath,
+      serverArgs: options.serverArgs ?? [FAKE_SERVER, tracePath],
+      initializationOptions: {},
+    }),
+  );
+  const agent = spawn(process.execPath, [AGENT, configPath], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const exited = new Promise((resolve) => agent.once('exit', (code) => resolve(code)));
+  t.after(async () => {
+    if (agent.exitCode === null) agent.kill('SIGKILL');
+    await exited;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return { agent, exited, root, sessionDir, tracePath };
+}
+
+test('a shutdown request stops the server and removes only session files', async (t) => {
+  const { exited, root, sessionDir, tracePath } = startAgent(t);
+  await waitForFile(path.join(sessionDir, 'ready.json'));
+  await request(sessionDir, 1, 'fresh/ping', {}, undefined);
+
+  // A file the transport did not create must survive, and a symlink inside the
+  // session must be unlinked rather than followed.
+  const outside = path.join(root, 'outside.txt');
+  fs.writeFileSync(outside, 'keep me');
+  fs.symlinkSync(outside, path.join(sessionDir, 'response-0000000099.json'));
+
+  fs.writeFileSync(path.join(sessionDir, 'shutdown.json'), '{}');
+  assert.equal(await exited, 0);
+  assert.equal(fs.existsSync(sessionDir), false);
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'keep me');
+  assert.ok(traceMessages(tracePath).some((message) => message.method === 'shutdown'));
+});
+
+test('unknown files keep the session directory in place', async (t) => {
+  const { exited, sessionDir } = startAgent(t);
+  await waitForFile(path.join(sessionDir, 'ready.json'));
+  fs.writeFileSync(path.join(sessionDir, 'notes.txt'), 'not ours');
+
+  fs.writeFileSync(path.join(sessionDir, 'shutdown.json'), '{}');
+  assert.equal(await exited, 0);
+  assert.deepEqual(fs.readdirSync(sessionDir), ['notes.txt']);
+});
+
+test('stale responses are swept while fresh ones are kept', async (t) => {
+  const { sessionDir } = startAgent(t);
+  await waitForFile(path.join(sessionDir, 'ready.json'));
+  const stale = path.join(sessionDir, 'response-0000000001.json');
+  const fresh = path.join(sessionDir, 'response-0000000002.json');
+  fs.writeFileSync(stale, '{}');
+  fs.writeFileSync(fresh, '{}');
+  const old = new Date(Date.now() - 120_000);
+  fs.utimesSync(stale, old, old);
+
+  const started = Date.now();
+  while (fs.existsSync(stale) && Date.now() - started < 5000) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(fs.existsSync(stale), false);
+  assert.equal(fs.existsSync(fresh), true);
+});
+
+test('a startup failure keeps fatal.json until the plugin asks to stop', async (t) => {
+  const { agent, exited, sessionDir } = startAgent(t, {
+    serverCommand: path.join(os.tmpdir(), 'fresh-copilot-missing-server'),
+    serverArgs: [],
+  });
+  const fatal = JSON.parse(await waitForFile(path.join(sessionDir, 'fatal.json')));
+  assert.match(fatal.message, /ENOENT/);
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(agent.exitCode, null);
+
+  fs.writeFileSync(path.join(sessionDir, 'shutdown.json'), '{}');
+  assert.equal(await exited, 1);
+  assert.equal(fs.existsSync(sessionDir), false);
+});

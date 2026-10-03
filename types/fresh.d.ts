@@ -47,7 +47,10 @@ interface EditorAPI {
   readFile(path: string | LocalPath): string | null | undefined;
   writeFile(path: string | LocalPath, content: string): boolean;
   createDir(path: string | LocalPath): boolean;
-  removePath(path: string | LocalPath): boolean;
+  scratchCreate?(label: string): string | null;
+  scratchPath?(token: string): string | null;
+  scratchDiscard?(token: string): boolean;
+  getAuthorityLabel?(): string;
   workspaceTrustLevel(): string;
 
   defineConfigBoolean(
