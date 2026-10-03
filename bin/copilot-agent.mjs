@@ -33,7 +33,6 @@ const RESPONSE_MAX_AGE_MS = 60_000;
 const SESSION_FILE_PATTERN =
   /^(copilot-agent\.mjs|config\.json|ready\.json|fatal\.json|status\.json|server\.log|shutdown\.json|(request|response)-\d+\.json)(\.\d+\.tmp)?$/;
 
-
 function writeJsonAtomic(path, value) {
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, JSON.stringify(value));
