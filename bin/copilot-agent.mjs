@@ -4,6 +4,8 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmdirSync,
+  statSync,
   unlinkSync,
   unwatchFile,
   watch,
@@ -24,12 +26,68 @@ const readyPath = join(sessionDir, "ready.json");
 const fatalPath = join(sessionDir, "fatal.json");
 const statusPath = join(sessionDir, "status.json");
 const logPath = join(sessionDir, "server.log");
+const shutdownPath = join(sessionDir, "shutdown.json");
 const initialParentPid = process.ppid;
+
+const RESPONSE_MAX_AGE_MS = 60_000;
+const SESSION_FILE_PATTERN =
+  /^(copilot-agent\.mjs|config\.json|ready\.json|fatal\.json|status\.json|server\.log|shutdown\.json|(request|response)-\d+\.json)(\.\d+\.tmp)?$/;
 
 function writeJsonAtomic(path, value) {
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, JSON.stringify(value));
   renameSync(temporary, path);
+}
+
+function removeSessionDir() {
+  let entries = [];
+  try {
+    entries = readdirSync(sessionDir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!SESSION_FILE_PATTERN.test(entry)) continue;
+    try {
+      unlinkSync(join(sessionDir, entry));
+    } catch {
+      // Already gone or not ours to remove.
+    }
+  }
+  try {
+    rmdirSync(sessionDir);
+  } catch {
+    // Unknown files remain, or the editor already discarded the directory.
+  }
+}
+
+function sweepStaleResponses() {
+  let entries;
+  try {
+    entries = readdirSync(sessionDir).filter((entry) =>
+      /^response-\d+\.json$/.test(entry),
+    );
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - RESPONSE_MAX_AGE_MS;
+  for (const entry of entries) {
+    const path = join(sessionDir, entry);
+    try {
+      if (statSync(path).mtimeMs < cutoff) unlinkSync(path);
+    } catch {
+      // The plugin may be reading it right now; try again next sweep.
+    }
+  }
+}
+
+function shutdownRequested() {
+  try {
+    statSync(shutdownPath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function serializeError(error) {
@@ -374,6 +432,10 @@ async function processRequest(path) {
 }
 
 function scanRequests() {
+  if (shutdownRequested()) {
+    void shutdown(0);
+    return;
+  }
   let entries;
   try {
     entries = readdirSync(sessionDir)
@@ -432,7 +494,11 @@ function startRequestStatWatcher() {
   }
 }
 
+let shuttingDown = false;
+
 async function shutdown(code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   clearInterval(requestTimer);
   clearInterval(lifecycleTimer);
   if (requestWatcher) {
@@ -447,7 +513,28 @@ async function shutdown(code = 0) {
     requestStatWatcherActive = false;
   }
   if (client) await client.stop();
+  removeSessionDir();
   process.exit(code);
+}
+
+function exitAfterFatal() {
+  const started = Date.now();
+  const timer = setInterval(() => {
+    let parentGone = false;
+    if (initialParentPid > 1) {
+      try {
+        process.kill(initialParentPid, 0);
+      } catch {
+        parentGone = true;
+      }
+    }
+    if (shutdownRequested() || parentGone || Date.now() - started > 60_000) {
+      clearInterval(timer);
+      if (client) client.child.kill();
+      removeSessionDir();
+      process.exit(1);
+    }
+  }, 200);
 }
 
 let requestTimer;
@@ -461,12 +548,16 @@ try {
   writeJsonAtomic(readyPath, { ready: true, pid: process.pid });
 } catch (error) {
   writeJsonAtomic(fatalPath, serializeError(error));
-  process.exit(1);
+  exitAfterFatal();
+  await new Promise(() => {});
 }
 
 try {
   requestWatcher = watch(sessionDir, { persistent: false }, (_eventType, filename) => {
-    if (filename === null || /^request-\d+\.json$/.test(String(filename))) {
+    if (
+      filename === null ||
+      /^(request-\d+|shutdown)\.json$/.test(String(filename))
+    ) {
       queueRequestScan();
     }
   });
@@ -484,7 +575,10 @@ try {
   startRequestStatWatcher();
 }
 scanRequests();
-requestTimer = setInterval(scanRequests, 1000);
+requestTimer = setInterval(() => {
+  scanRequests();
+  sweepStaleResponses();
+}, 1000);
 lifecycleTimer = setInterval(() => {
   if (Date.now() - lastActivity > 30 * 60_000) {
     void shutdown(0);

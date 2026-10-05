@@ -113,7 +113,7 @@ Settings appear under the `fresh-copilot` plugin in Fresh's Settings UI.
 
 Completion requests are handled by GitHub's official Copilot language server. Source context required for a completion is therefore subject to GitHub's Copilot terms and privacy documentation. This plugin does not add analytics or send code to another service.
 
-Fresh's plugin process API does not expose a bidirectional stdin stream, so the plugin and its local transport exchange short-lived JSON files under the OS temporary directory. Request files are removed after each response, the transport exits after 30 minutes of inactivity, and its language-server child is shut down with it. Current document text remains in transport memory only while that process is alive.
+Fresh's plugin process API does not expose a bidirectional stdin stream, so the plugin and its local transport exchange short-lived JSON files in a session directory. On the local authority that directory is an editor-owned scratch directory (Fresh 0.5+), which Fresh removes when the session ends; on remote authorities and older Fresh releases it lives under the OS temporary directory. The plugin never deletes files itself: the transport removes each request once it answers it, sweeps unread responses after a minute, and on shutdown unlinks only the files it knows and removes the then-empty directory. Stopping Copilot asks the transport to shut down its language server cleanly, with a kill only as a fallback, and the transport also exits after 30 minutes of inactivity. Current document text remains in transport memory only while that process is alive.
 
 ## Development
 
