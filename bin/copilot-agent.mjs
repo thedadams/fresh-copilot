@@ -542,13 +542,25 @@ let lifecycleTimer;
 let requestWatcher;
 let requestStatWatcherActive = false;
 
+// The request watcher starts after initialization, but shutdown cannot wait for it.
+requestTimer = setInterval(() => {
+  if (shutdownRequested()) void shutdown(0);
+}, 100);
+
 try {
   client = new JsonRpcClient(config.serverCommand, config.serverArgs, config.cwd);
   await client.initialize();
+  clearInterval(requestTimer);
+  if (shuttingDown) await new Promise(() => {});
+
   writeJsonAtomic(readyPath, { ready: true, pid: process.pid });
 } catch (error) {
-  writeJsonAtomic(fatalPath, serializeError(error));
-  exitAfterFatal();
+  clearInterval(requestTimer);
+  if (!shuttingDown) {
+    writeJsonAtomic(fatalPath, serializeError(error));
+    exitAfterFatal();
+  }
+
   await new Promise(() => {});
 }
 

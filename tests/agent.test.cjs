@@ -193,6 +193,33 @@ test('a shutdown request stops the server and removes only session files', async
   assert.ok(traceMessages(tracePath).some((message) => message.method === 'shutdown'));
 });
 
+test('a shutdown request during initialization cleans up within the plugin grace period', async (t) => {
+  const { exited, sessionDir } = startAgent(t, {
+    serverArgs: [
+      '-e',
+      'process.stdin.once("data", () => process.stderr.write("initializing\\n")); process.stdin.resume();',
+    ],
+  });
+  await waitForFile(path.join(sessionDir, 'server.log'));
+  assert.equal(fs.existsSync(path.join(sessionDir, 'ready.json')), false);
+
+  fs.writeFileSync(path.join(sessionDir, 'shutdown.json'), '{}');
+  let timer;
+  try {
+    const code = await Promise.race([
+      exited,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('shutdown exceeded the plugin grace period')), 3000);
+      }),
+    ]);
+    assert.equal(code, 0);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  assert.equal(fs.existsSync(sessionDir), false);
+});
+
 test('unknown files keep the session directory in place', async (t) => {
   const { exited, sessionDir } = startAgent(t);
   await waitForFile(path.join(sessionDir, 'ready.json'));
