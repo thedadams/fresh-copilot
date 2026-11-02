@@ -1,8 +1,11 @@
 import { spawn } from "node:child_process";
 import {
+  accessSync,
   appendFileSync,
+  constants as fsConstants,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmdirSync,
   statSync,
@@ -12,7 +15,7 @@ import {
   watchFile,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 
 const configPath = process.argv[2];
 if (!configPath) {
@@ -88,6 +91,50 @@ function shutdownRequested() {
   } catch {
     return false;
   }
+}
+
+function isExecutable(path) {
+  try {
+    accessSync(path, fsConstants.X_OK);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// The npm launcher runs the server inside whichever node is on PATH. Homebrew's
+// node is ad-hoc signed, so every node upgrade invalidates the keychain grant
+// for the Copilot token. The package's native binary is signed by GitHub, so
+// prefer it on macOS when the default command is in use. The candidate paths
+// mirror the ones the launcher itself falls back to.
+function resolveServerCommand(command) {
+  if (process.platform !== "darwin" || command !== "copilot-language-server") {
+    return command;
+  }
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (dir.length === 0) continue;
+    const candidate = join(dir, command);
+    if (!isExecutable(candidate)) continue;
+    let launcher;
+    try {
+      launcher = realpathSync(candidate);
+    } catch {
+      return command;
+    }
+    const root = join(dirname(launcher), "..");
+    const binary = join(
+      `copilot-language-server-${process.platform}-${process.arch}`,
+      "copilot-language-server",
+    );
+    for (const nativePath of [
+      join(root, "node_modules", "@github", binary),
+      join(root, "..", binary),
+    ]) {
+      if (isExecutable(nativePath)) return nativePath;
+    }
+    return command;
+  }
+  return command;
 }
 
 function serializeError(error) {
@@ -548,7 +595,11 @@ requestTimer = setInterval(() => {
 }, 100);
 
 try {
-  client = new JsonRpcClient(config.serverCommand, config.serverArgs, config.cwd);
+  client = new JsonRpcClient(
+    resolveServerCommand(config.serverCommand),
+    config.serverArgs,
+    config.cwd,
+  );
   await client.initialize();
   clearInterval(requestTimer);
   if (shuttingDown) await new Promise(() => {});

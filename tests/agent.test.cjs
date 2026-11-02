@@ -164,6 +164,7 @@ function startAgent(t, options = {}) {
     }),
   );
   const agent = spawn(process.execPath, [AGENT, configPath], {
+    env: options.env ?? process.env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const exited = new Promise((resolve) => agent.once('exit', (code) => resolve(code)));
@@ -247,6 +248,57 @@ test('stale responses are swept while fresh ones are kept', async (t) => {
   assert.equal(fs.existsSync(stale), false);
   assert.equal(fs.existsSync(fresh), true);
 });
+
+function installFakeServerPackage(root, { native }) {
+  const markerPath = path.join(root, 'server-used');
+  const wrapper = (name) =>
+    `#!/bin/sh\nprintf ${name} > ${JSON.stringify(markerPath)}\n` +
+    `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_SERVER)} "$@"\n`;
+  const packageDir = path.join(root, 'lib', 'copilot-language-server');
+  const launcher = path.join(packageDir, 'dist', 'language-server.js');
+  fs.mkdirSync(path.dirname(launcher), { recursive: true });
+  fs.writeFileSync(launcher, wrapper('launcher'), { mode: 0o755 });
+  if (native) {
+    const nativePath = path.join(
+      packageDir,
+      'node_modules',
+      '@github',
+      `copilot-language-server-${process.platform}-${process.arch}`,
+      'copilot-language-server',
+    );
+    fs.mkdirSync(path.dirname(nativePath), { recursive: true });
+    fs.writeFileSync(nativePath, wrapper('native'), { mode: 0o755 });
+  }
+  const binDir = path.join(root, 'bin');
+  fs.mkdirSync(binDir);
+  fs.symlinkSync(launcher, path.join(binDir, 'copilot-language-server'));
+  return { binDir, markerPath };
+}
+
+for (const [native, expected] of [
+  [true, 'native'],
+  [false, 'launcher'],
+]) {
+  test(
+    `the default server command runs the ${expected} server on macOS`,
+    { skip: process.platform !== 'darwin' },
+    async (t) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-copilot-package-'));
+      t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+      const { binDir, markerPath } = installFakeServerPackage(root, { native });
+      const tracePath = path.join(root, 'trace.jsonl');
+      fs.writeFileSync(tracePath, '');
+
+      const { sessionDir } = startAgent(t, {
+        serverCommand: 'copilot-language-server',
+        serverArgs: [tracePath],
+        env: { ...process.env, PATH: binDir },
+      });
+      await waitForFile(path.join(sessionDir, 'ready.json'));
+      assert.equal(fs.readFileSync(markerPath, 'utf8'), expected);
+    },
+  );
+}
 
 test('a startup failure keeps fatal.json until the plugin asks to stop', async (t) => {
   const { agent, exited, sessionDir } = startAgent(t, {
