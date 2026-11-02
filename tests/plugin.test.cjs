@@ -235,7 +235,11 @@ function createHarness(options = {}) {
       }
       return true;
     },
-    getEditorMode: () => state.editorMode,
+    getEditorMode: () =>
+      state.editorMode === null && 'unsetEditorMode' in options
+        ? options.unsetEditorMode
+        : state.editorMode,
+    getInputMode: () => options.inputMode ?? null,
     setContext: (name, active) => {
       state.contexts.push({ name, active });
       return true;
@@ -564,6 +568,59 @@ test('suggestions leave unsupported editor modes untouched', async () => {
 
   assert.equal(harness.state.virtualTexts.at(-1).text, '42;');
   assert.equal(harness.state.editorMode, 'vi-normal');
+  assert.deepEqual(harness.state.editorModeChanges, []);
+});
+
+test('suggestions layer Tab over an unset editor mode reported as undefined', async () => {
+  const harness = createHarness({
+    unsetEditorMode: undefined,
+    responses: [{ items: [{ insertText: '42;' }] }],
+  });
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  await harness.resolveNextDelay();
+
+  assert.equal(harness.state.editorMode, 'fresh-copilot-suggestion');
+
+  await harness.fire('fresh_copilot_accept');
+
+  assert.equal(harness.state.text, 'const answer = 42;');
+  assert.equal(harness.state.editorMode, null);
+});
+
+test('suggestions layer Tab over the vi insert input mode', async () => {
+  const harness = createHarness({
+    unsetEditorMode: undefined,
+    inputMode: 'vi-insert',
+    responses: [{ items: [{ insertText: '42;' }] }],
+  });
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  await harness.resolveNextDelay();
+
+  assert.equal(harness.state.editorMode, 'fresh-copilot-suggestion-vi-insert');
+
+  await harness.fire('fresh_copilot_accept');
+
+  assert.equal(harness.state.text, 'const answer = 42;');
+  assert.equal(harness.state.editorMode, null);
+  assert.deepEqual(harness.state.editorModeChanges, [
+    'fresh-copilot-suggestion-vi-insert',
+    null,
+  ]);
+});
+
+test('suggestions leave unsupported input modes untouched', async () => {
+  const harness = createHarness({
+    unsetEditorMode: undefined,
+    inputMode: 'vi-normal',
+    responses: [{ items: [{ insertText: '42;' }] }],
+  });
+
+  await harness.fire('fresh_copilot_after_insert', { buffer_id: 1 });
+  await harness.resolveNextDelay();
+
+  assert.equal(harness.state.virtualTexts.at(-1).text, '42;');
   assert.deepEqual(harness.state.editorModeChanges, []);
 });
 
