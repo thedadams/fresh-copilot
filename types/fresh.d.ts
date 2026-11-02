@@ -126,7 +126,8 @@ interface EditorAPI {
     inheritNormalBindings?: boolean,
   ): boolean;
   setEditorMode(mode: string | null): boolean;
-  getEditorMode(): string | null;
+  getEditorMode(): string | null | undefined;
+  getInputMode?(): string | null | undefined;
   setContext(name: string, active: boolean): boolean;
   prompt(label: string, initialValue: string): Promise<string | null>;
   copyToClipboard(text: string): void;

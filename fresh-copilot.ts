@@ -224,13 +224,21 @@ function bumpRevision(bufferId: number): void {
   revisions.set(bufferId, revision(bufferId) + 1);
 }
 
+// Fresh reports an unset mode as undefined, not null.
+function currentEditorMode(): string | null {
+  return editor.getEditorMode() ?? null;
+}
+
 function activateSuggestionMode(): void {
   if (suggestionModeActive) return;
-  const previousMode = editor.getEditorMode();
+  const previousMode = currentEditorMode();
+  // Fresh 0.5.7 moved vi from the window's editor mode to the editor-wide
+  // input mode; older versions report vi-insert as the editor mode.
+  const viMode = previousMode ?? editor.getInputMode?.() ?? null;
   const mode =
-    previousMode === null
+    viMode === null
       ? SUGGESTION_MODE
-      : previousMode === "vi-insert"
+      : viMode === "vi-insert"
         ? SUGGESTION_VI_INSERT_MODE
         : null;
   if (mode === null) return;
@@ -250,7 +258,7 @@ function deactivateSuggestionMode(): void {
   suggestionModeActive = false;
   suggestionPreviousMode = null;
   activeSuggestionMode = null;
-  const currentMode = editor.getEditorMode();
+  const currentMode = currentEditorMode();
   if (currentMode === mode || currentMode === previousMode) {
     editor.setEditorMode(previousMode);
   }
