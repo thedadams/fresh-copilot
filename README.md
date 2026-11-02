@@ -32,6 +32,8 @@ copilot-language-server --version
 
 If the executable lives elsewhere, set `serverCommand` and `serverArgs` in Fresh's plugin settings.
 
+On macOS, when `serverCommand` is left at its default, the plugin runs the GitHub-signed native binary bundled in the npm package instead of the Node launcher. The keychain then keeps its "Always Allow" grant for the Copilot token across Node.js upgrades.
+
 For remote Fresh authorities, Node.js and the Copilot language server must be available in that authority's environment. The plugin copies its transport script into the authority's temporary directory before starting it.
 
 ## Install the plugin
